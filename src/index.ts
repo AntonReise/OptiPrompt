@@ -1,227 +1,103 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import Anthropic from "@anthropic-ai/sdk";
+import dotenv from "dotenv";
 
-const NWS_API_BASE = "https://api.weather.gov";
-const USER_AGENT = "optiprompt/1.0";
+// Load environment variables from .env file
+dotenv.config();
+
+// Initialize Anthropic client
+// The client automatically looks for the ANTHROPIC_API_KEY environment variable.
+const anthropic = new Anthropic();
 
 // Create server instance
 const server = new McpServer({
   name: "optiprompt",
   version: "1.0.0",
-  capabilities: {
-    resources: {},
-    tools: {},
-  },
 });
 
-// Helper function for making NWS API requests
-async function makeNWSRequest<T>(url: string): Promise<T | null> {
-    const headers = {
-      "User-Agent": USER_AGENT,
-      Accept: "application/geo+json",
-    };
-  
-    try {
-      const response = await fetch(url, { headers });
-      if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+// System prompt for the optimization task
+const OPTIMIZATION_SYSTEM_PROMPT = `You are an expert prompt engineer. Your task is to rewrite a user's prompt to be clearer, more specific, and more effective for a large language model.
+Focus on adding detail, clarifying intent, and structuring the prompt for the best possible output.
+Return only the optimized prompt, without any preambles, explanations, or quotation marks.`;
+
+// Register the prompt optimization tool
+server.tool(
+  "optimize-prompt",
+  "Optimizes a user's prompt by refining it for clarity and effectiveness.",
+  {
+    prompt: z.string().describe("The user prompt to be optimized."),
+  },
+  async ({ prompt }) => {
+    // Check if the Anthropic API key is available
+    if (!process.env.ANTHROPIC_API_KEY) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: "ANTHROPIC_API_KEY environment variable is not set. Please configure it to use this tool.",
+            },
+          ],
+          isError: true,
+        };
       }
-      return (await response.json()) as T;
+
+    try {
+      const response = await anthropic.messages.create({
+        model: "claude-3-haiku-20240307", // Using Haiku for speed and cost-effectiveness
+        max_tokens: 1024,
+        system: OPTIMIZATION_SYSTEM_PROMPT,
+        messages: [
+          {
+            role: "user",
+            content: prompt,
+          },
+        ],
+      });
+
+      // Find the first text block in the response
+      const textBlock = response.content.find(
+        (block): block is Anthropic.TextBlock => block.type === "text",
+      );
+
+      if (!textBlock) {
+        throw new Error("No text content found in the API response.");
+      }
+      
+      const optimizedPrompt = textBlock.text;
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: optimizedPrompt,
+          },
+        ],
+      };
     } catch (error) {
-      console.error("Error making NWS request:", error);
-      return null;
+      console.error("Error calling Anthropic API:", error);
+      const errorMessage = error instanceof Error ? error.message : "An unknown error occurred.";
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Failed to optimize prompt. Error: ${errorMessage}`,
+          },
+        ],
+        isError: true,
+      };
     }
   }
-  
-  interface AlertFeature {
-    properties: {
-      event?: string;
-      areaDesc?: string;
-      severity?: string;
-      status?: string;
-      headline?: string;
-    };
-  }
-  
-  // Format alert data
-  function formatAlert(feature: AlertFeature): string {
-    const props = feature.properties;
-    return [
-      `Event: ${props.event || "Unknown"}`,
-      `Area: ${props.areaDesc || "Unknown"}`,
-      `Severity: ${props.severity || "Unknown"}`,
-      `Status: ${props.status || "Unknown"}`,
-      `Headline: ${props.headline || "No headline"}`,
-      "---",
-    ].join("\n");
-  }
-  
-  interface ForecastPeriod {
-    name?: string;
-    temperature?: number;
-    temperatureUnit?: string;
-    windSpeed?: string;
-    windDirection?: string;
-    shortForecast?: string;
-  }
-  
-  interface AlertsResponse {
-    features: AlertFeature[];
-  }
-  
-  interface PointsResponse {
-    properties: {
-      forecast?: string;
-    };
-  }
-  
-  interface ForecastResponse {
-    properties: {
-      periods: ForecastPeriod[];
-    };
-  }
+);
 
-  // Register weather tools
-server.tool(
-    "optimize-prompt",
-    "Optimize the users prompt to improve output",
-    {
-      state: z.string().length(2).describe("Two-letter state code (e.g. CA, NY)"),
-    },
-    async ({ state }) => {
-      const stateCode = state.toUpperCase();
-      const alertsUrl = `${NWS_API_BASE}/alerts?area=${stateCode}`;
-      const alertsData = await makeNWSRequest<AlertsResponse>(alertsUrl);
-  
-      if (!alertsData) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Failed to retrieve alerts data",
-            },
-          ],
-        };
-      }
-  
-      const features = alertsData.features || [];
-      if (features.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `No active alerts for ${stateCode}`,
-            },
-          ],
-        };
-      }
-  
-      const formattedAlerts = features.map(formatAlert);
-      const alertsText = `Active alerts for ${stateCode}:\n\n${formattedAlerts.join("\n")}`;
-  
-      return {
-        content: [
-          {
-            type: "text",
-            text: alertsText,
-          },
-        ],
-      };
-    },
-  );
-  
-  server.tool(
-    "get-forecast",
-    "Get weather forecast for a location",
-    {
-      latitude: z.number().min(-90).max(90).describe("Latitude of the location"),
-      longitude: z.number().min(-180).max(180).describe("Longitude of the location"),
-    },
-    async ({ latitude, longitude }) => {
-      // Get grid point data
-      const pointsUrl = `${NWS_API_BASE}/points/${latitude.toFixed(4)},${longitude.toFixed(4)}`;
-      const pointsData = await makeNWSRequest<PointsResponse>(pointsUrl);
-  
-      if (!pointsData) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: `Failed to retrieve grid point data for coordinates: ${latitude}, ${longitude}. This location may not be supported by the NWS API (only US locations are supported).`,
-            },
-          ],
-        };
-      }
-  
-      const forecastUrl = pointsData.properties?.forecast;
-      if (!forecastUrl) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Failed to get forecast URL from grid point data",
-            },
-          ],
-        };
-      }
-  
-      // Get forecast data
-      const forecastData = await makeNWSRequest<ForecastResponse>(forecastUrl);
-      if (!forecastData) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "Failed to retrieve forecast data",
-            },
-          ],
-        };
-      }
-  
-      const periods = forecastData.properties?.periods || [];
-      if (periods.length === 0) {
-        return {
-          content: [
-            {
-              type: "text",
-              text: "No forecast periods available",
-            },
-          ],
-        };
-      }
-  
-      // Format forecast periods
-      const formattedForecast = periods.map((period: ForecastPeriod) =>
-        [
-          `${period.name || "Unknown"}:`,
-          `Temperature: ${period.temperature || "Unknown"}°${period.temperatureUnit || "F"}`,
-          `Wind: ${period.windSpeed || "Unknown"} ${period.windDirection || ""}`,
-          `${period.shortForecast || "No forecast available"}`,
-          "---",
-        ].join("\n"),
-      );
-  
-      const forecastText = `Forecast for ${latitude}, ${longitude}:\n\n${formattedForecast.join("\n")}`;
-  
-      return {
-        content: [
-          {
-            type: "text",
-            text: forecastText,
-          },
-        ],
-      };
-    },
-  );
+async function main() {
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error("OptiPrompt MCP Server running on stdio");
+}
 
-  async function main() {
-    const transport = new StdioServerTransport();
-    await server.connect(transport);
-    console.error("Weather MCP Server running on stdio");
-  }
-  
-  main().catch((error) => {
-    console.error("Fatal error in main():", error);
-    process.exit(1);
-  });
+main().catch((error) => {
+  console.error("Fatal error in main():", error);
+  process.exit(1);
+});
